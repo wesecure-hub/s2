@@ -1,0 +1,1065 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create project files
+        run: |
+          mkdir -p breakout/app/src/main/java/com/scan/breakout
+          cat > breakout/settings.gradle.kts <<'KTEOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "BreakoutScanner"
+          include(":app")
+          KTEOF
+          cat > breakout/build.gradle.kts <<'KTEOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          KTEOF
+          cat > breakout/gradle.properties <<'KTEOF'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.useAndroidX=false
+          KTEOF
+          cat > breakout/app/build.gradle.kts <<'KTEOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.scan.breakout"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.scan.breakout"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          KTEOF
+          cat > breakout/app/src/main/AndroidManifest.xml <<'KTEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="Breakout Scanner"
+                  android:theme="@android:style/Theme.Material.Light">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustPan">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".WatchJob"
+                      android:exported="false"
+                      android:permission="android.permission.BIND_JOB_SERVICE" />
+              </application>
+          </manifest>
+          KTEOF
+          cat > breakout/app/src/main/java/com/scan/breakout/Core.kt <<'KTEOF'
+          package com.scan.breakout
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.content.Context
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Build
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.text.SimpleDateFormat
+          import java.util.Calendar
+          import java.util.Locale
+          import org.json.JSONObject
+
+          class Bars(
+              val t: LongArray, val c: DoubleArray, val h: DoubleArray,
+              val l: DoubleArray, val v: DoubleArray
+          )
+
+          class Res(
+              val sym: String, val il: Boolean, val price: Double, val status: String,
+              val pivot: Double, val dist: Double, val volX: Double, val contr: String,
+              val fromHigh: Double, val entry: Double, val stop: Double, val stopPct: Double,
+              val wild: Boolean, val avgVol: Double, val trend: Boolean, val vcp: Boolean,
+              val rsRaw: Double, val rsHigh: Boolean
+          ) {
+              var rs: Double = 0.0
+              var tier: String = ""
+              var sector: String = ""
+              var earn: String = ""
+              var isNew: Boolean = false
+
+              fun toLine(): String {
+                  val parts = ArrayList<String>()
+                  parts.add(sym)
+                  parts.add(if (il) "1" else "0")
+                  parts.add(price.toString())
+                  parts.add(status)
+                  parts.add(pivot.toString())
+                  parts.add(dist.toString())
+                  parts.add(volX.toString())
+                  parts.add(contr)
+                  parts.add(fromHigh.toString())
+                  parts.add(entry.toString())
+                  parts.add(stop.toString())
+                  parts.add(stopPct.toString())
+                  parts.add(if (wild) "1" else "0")
+                  parts.add(avgVol.toString())
+                  parts.add(if (trend) "1" else "0")
+                  parts.add(if (vcp) "1" else "0")
+                  parts.add(rsRaw.toString())
+                  parts.add(if (rsHigh) "1" else "0")
+                  parts.add(rs.toString())
+                  parts.add(tier)
+                  parts.add(sector)
+                  parts.add(earn)
+                  return parts.joinToString("|")
+              }
+
+              companion object {
+                  fun fromLine(s: String): Res? {
+                      try {
+                          val p = s.split("|")
+                          if (p.size < 22) return null
+                          val r = Res(
+                              p[0], p[1] == "1", p[2].toDouble(), p[3], p[4].toDouble(), p[5].toDouble(),
+                              p[6].toDouble(), p[7], p[8].toDouble(), p[9].toDouble(), p[10].toDouble(),
+                              p[11].toDouble(), p[12] == "1", p[13].toDouble(), p[14] == "1", p[15] == "1",
+                              p[16].toDouble(), p[17] == "1"
+                          )
+                          r.rs = p[18].toDouble()
+                          r.tier = p[19]
+                          r.sector = p[20]
+                          r.earn = p[21]
+                          return r
+                      } catch (e: Exception) {
+                          return null
+                      }
+                  }
+              }
+          }
+
+          object Core {
+
+              @Volatile
+              var cancelled = false
+
+              // Best-effort lists (from a 2020 TASE snapshot). Edit them inside the app.
+              const val DEFAULT_IL35 = "LUMI POLI DSCT MZTF FIBI NICE TEVA ESLT ICL BEZQ AZRG TSEM NVMI CAMT ENLT ENRG " +
+                  "HARL PHOE CLIS MGDL STRS SAE ORL MLSR AMOT ILCO MVNE BIG ARPT ALHE SPEN MTRX FORTY ELTR SKBN"
+
+              const val DEFAULT_IL90 = "BYSD PZOL AUDC HLAN ENOG MTRN RIT1 MGOR DANE PTNR BVC FIBIH ISCD RMLI AFPR MGIC " +
+                  "KEN TASE EQTL OPCE INRM SMT FTAL ALLT KMDA ASHG MMHD CEL SLARL ONE DLEA ELWS ECP ARAD NVLG DIMRI " +
+                  "ASPF GZT AUGN BLSR NTML FRSM IDIN ARKO BCNV ISRS MDTR HAML TDRN AZRM AFRE KRUR VCTR ARD ATRY MLTM " +
+                  "DELT ELLO ISCN ILX NFTA PLSN DLEKG YHNF ELCRE AVGL ASPR ADGR IES ILDC MTDS VTNA CRSO LVPR HAP " +
+                  "FBRT DORL GILT CGEN SPNS ELCO FOX"
+
+              fun parseIl(raw: String): List<String> =
+                  raw.split(Regex("[\\s,;]+"))
+                      .map { it.trim().uppercase() }
+                      .filter { it.isNotEmpty() }
+                      .map { if (it.endsWith(".TA")) it else it + ".TA" }
+                      .distinct()
+
+              // ------------------------------------------------------------ network
+              fun http(url: String): String? {
+                  for (attempt in 0 until 3) {
+                      if (cancelled) return null
+                      try {
+                          val cn = URL(url).openConnection() as HttpURLConnection
+                          cn.connectTimeout = 10000
+                          cn.readTimeout = 15000
+                          cn.setRequestProperty("Accept", "application/json, text/plain, */*")
+                          cn.setRequestProperty(
+                              "User-Agent",
+                              "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36"
+                          )
+                          val code = cn.responseCode
+                          if (code == 200) {
+                              val t = cn.inputStream.bufferedReader().use { it.readText() }
+                              cn.disconnect()
+                              return t
+                          }
+                          cn.disconnect()
+                          if (code == 404) return null
+                          Thread.sleep(1200L * (attempt + 1))
+                      } catch (e: Exception) {
+                          try {
+                              Thread.sleep(600)
+                          } catch (ie: InterruptedException) {
+                          }
+                      }
+                  }
+                  return null
+              }
+
+              fun fetchBars(sym: String): Bars? {
+                  val txt = http("https://query1.finance.yahoo.com/v8/finance/chart/" + Uri.encode(sym) + "?range=2y&interval=1d")
+                      ?: return null
+                  try {
+                      val r0 = JSONObject(txt).getJSONObject("chart").getJSONArray("result").getJSONObject(0)
+                      val ts = r0.getJSONArray("timestamp")
+                      val q = r0.getJSONObject("indicators").getJSONArray("quote").getJSONObject(0)
+                      val cl = q.getJSONArray("close")
+                      val hi = q.getJSONArray("high")
+                      val lo = q.getJSONArray("low")
+                      val vo = q.optJSONArray("volume")
+                      val t = ArrayList<Long>()
+                      val c = ArrayList<Double>()
+                      val h = ArrayList<Double>()
+                      val l = ArrayList<Double>()
+                      val v = ArrayList<Double>()
+                      for (i in 0 until cl.length()) {
+                          if (cl.isNull(i) || hi.isNull(i) || lo.isNull(i)) continue
+                          t.add(ts.getLong(i))
+                          c.add(cl.getDouble(i))
+                          h.add(hi.getDouble(i))
+                          l.add(lo.getDouble(i))
+                          v.add(if (vo == null || vo.isNull(i)) 0.0 else vo.getDouble(i))
+                      }
+                      return Bars(t.toLongArray(), c.toDoubleArray(), h.toDoubleArray(), l.toDoubleArray(), v.toDoubleArray())
+                  } catch (e: Exception) {
+                      return null
+                  }
+              }
+
+              fun loadIndex(cands: List<String>): Bars? {
+                  for (s in cands) {
+                      val b = fetchBars(s)
+                      if (b != null && b.c.size >= 200) return b
+                  }
+                  return null
+              }
+
+              fun trendText(b: Bars?): String {
+                  if (b == null || b.c.size < 200) return "n/a"
+                  val n = b.c.size
+                  val s50 = avg(b.c, n - 50, n)
+                  val s200 = avg(b.c, n - 200, n)
+                  return if (b.c[n - 1] > s50 && s50 > s200) "uptrend" else "WEAK"
+              }
+
+              // ----------------------------------------------------------- universe
+              private fun splitCsv(line: String): List<String> {
+                  val out = ArrayList<String>()
+                  val sb = StringBuilder()
+                  var q = false
+                  for (ch in line) {
+                      if (ch == '"') {
+                          q = !q
+                      } else if (ch == ',' && !q) {
+                          out.add(sb.toString())
+                          sb.setLength(0)
+                      } else {
+                          sb.append(ch)
+                      }
+                  }
+                  out.add(sb.toString())
+                  return out
+              }
+
+              // symbol -> GICS sector
+              fun loadSp500(): Map<String, String> {
+                  val out = LinkedHashMap<String, String>()
+                  val t = http("https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv")
+                      ?: return out
+                  val lines = t.lines()
+                  if (lines.isEmpty()) return out
+                  val header = splitCsv(lines[0])
+                  var secIdx = -1
+                  for (i in header.indices) {
+                      if (header[i].contains("Sector") && secIdx < 0) secIdx = i
+                  }
+                  for (ln in lines.drop(1)) {
+                      if (ln.isBlank()) continue
+                      val p = splitCsv(ln)
+                      val sym = p[0].trim().replace(".", "-")
+                      if (sym.isEmpty()) continue
+                      out[sym] = if (secIdx >= 0 && secIdx < p.size) p[secIdx].trim() else ""
+                  }
+                  return out
+              }
+
+              fun loadNdx(): List<String> {
+                  val out = LinkedHashSet<String>()
+                  val t = http("https://api.nasdaq.com/api/quote/list-type/nasdaq100")
+                  if (t != null) {
+                      try {
+                          val rows = JSONObject(t).getJSONObject("data").getJSONObject("data").getJSONArray("rows")
+                          for (i in 0 until rows.length()) {
+                              val sym = rows.getJSONObject(i).getString("symbol").trim().replace(".", "-")
+                              if (sym.isNotEmpty()) out.add(sym)
+                          }
+                      } catch (e: Exception) {
+                      }
+                  }
+                  return out.toList()
+              }
+
+              // symbol -> earnings date (MM-dd) within the next 14 days (US only)
+              fun loadEarnings(): Map<String, String> {
+                  val out = HashMap<String, String>()
+                  val cal = Calendar.getInstance()
+                  val df = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+                  var fails = 0
+                  for (d in 0 until 14) {
+                      val dow = cal.get(Calendar.DAY_OF_WEEK)
+                      if (dow != Calendar.SATURDAY && dow != Calendar.SUNDAY) {
+                          val day = df.format(cal.time)
+                          val t = http("https://api.nasdaq.com/api/calendar/earnings?date=" + day)
+                          if (t == null) {
+                              fails++
+                          } else {
+                              try {
+                                  val rows = JSONObject(t).getJSONObject("data").optJSONArray("rows")
+                                  if (rows != null) {
+                                      for (i in 0 until rows.length()) {
+                                          val sym = rows.getJSONObject(i).getString("symbol").trim().replace(".", "-")
+                                          if (!out.containsKey(sym)) out[sym] = day.substring(5)
+                                      }
+                                  }
+                              } catch (e: Exception) {
+                              }
+                          }
+                          if (fails >= 2) break
+                      }
+                      cal.add(Calendar.DAY_OF_YEAR, 1)
+                  }
+                  return out
+              }
+
+              // ----------------------------------------------------------- analysis
+              // average of a[from until to]
+              fun avg(a: DoubleArray, from: Int, to: Int): Double {
+                  var s = 0.0
+                  for (i in from until to) s += a[i]
+                  return s / (to - from)
+              }
+
+              private fun fmt0(x: Double): String = String.format(Locale.US, "%.0f", x)
+
+              // Is the stock/benchmark ratio (RS line) at or near a 52-week high?
+              private fun rsLineHigh(b: Bars, bench: Bars?): Boolean {
+                  if (bench == null) return false
+                  val m = HashMap<Long, Double>()
+                  for (i in bench.t.indices) m[bench.t[i] / 86400L] = bench.c[i]
+                  val n = b.c.size
+                  var mx = 0.0
+                  var last = 0.0
+                  var cnt = 0
+                  for (i in (n - 252) until n) {
+                      val bv = m[b.t[i] / 86400L] ?: continue
+                      if (bv <= 0) continue
+                      val r = b.c[i] / bv
+                      if (r > mx) mx = r
+                      last = r
+                      cnt++
+                  }
+                  return cnt > 200 && last >= mx * 0.99
+              }
+
+              fun analyze(sym: String, il: Boolean, b: Bars, bench: Bars?): Res? {
+                  val n = b.c.size
+                  if (n < 260) return null
+                  val c = b.c
+                  val p = c[n - 1]
+                  if (p <= 0 || c[n - 63] <= 0 || c[n - 126] <= 0 || c[n - 189] <= 0 || c[n - 252] <= 0) return null
+
+                  // Minervini Trend Template
+                  val s50 = avg(c, n - 50, n)
+                  val s150 = avg(c, n - 150, n)
+                  val s200 = avg(c, n - 200, n)
+                  val s200Prev = avg(c, n - 222, n - 22)
+                  var lo = Double.MAX_VALUE
+                  var hi = 0.0
+                  for (i in (n - 252) until n) {
+                      lo = minOf(lo, c[i])
+                      hi = maxOf(hi, c[i])
+                  }
+                  val trend = p > s150 && p > s200 && s150 > s200 && s200 > s200Prev &&
+                      s50 > s150 && s50 > s200 && p > s50 &&
+                      p >= lo * 1.30 && p >= hi * 0.75
+
+                  // VCP: 3 shrinking contractions over the last 60 bars + volume dry-up
+                  val bs = n - 60
+                  val depths = DoubleArray(3)
+                  for (k in 0 until 3) {
+                      var mh = 0.0
+                      var ml = Double.MAX_VALUE
+                      for (i in (bs + k * 20) until (bs + (k + 1) * 20)) {
+                          mh = maxOf(mh, b.h[i])
+                          ml = minOf(ml, b.l[i])
+                      }
+                      depths[k] = if (mh > 0) (mh - ml) / mh else 1.0
+                  }
+                  val avg50v = avg(b.v, n - 50, n)
+                  val avg10v = avg(b.v, n - 10, n)
+                  val vcp = depths[0] > depths[1] && depths[1] > depths[2] &&
+                      depths[2] <= 0.10 && avg50v > 0 && avg10v < avg50v
+
+                  // Pivot and status
+                  var pivot = 0.0
+                  for (i in (n - 16) until (n - 1)) pivot = maxOf(pivot, b.h[i])
+                  if (pivot <= 0) return null
+                  val dist = p / pivot - 1
+                  val prevVol = avg(b.v, n - 51, n - 1)
+                  val volX = if (prevVol > 0) b.v[n - 1] / prevVol else 0.0
+                  val status = if (dist > 0 && volX >= 1.4 && dist <= 0.05) "BREAKOUT"
+                  else if (dist <= 0 && dist >= -0.03) "NEAR PIVOT"
+                  else "BUILDING"
+                  val entry = if (status == "BREAKOUT") p else pivot * 1.001
+
+                  // ATR(14) based stop: 2 x ATR, clamped between 3% and 8% below entry
+                  var atrSum = 0.0
+                  for (i in (n - 14) until n) {
+                      val pc = c[i - 1]
+                      val tr = maxOf(b.h[i] - b.l[i], Math.abs(b.h[i] - pc), Math.abs(b.l[i] - pc))
+                      atrSum += tr
+                  }
+                  val atr = atrSum / 14.0
+                  val rawPct = 2.0 * atr / entry
+                  val stopPct = minOf(maxOf(rawPct, 0.03), 0.08)
+                  val wild = rawPct > 0.08
+                  val stop = entry * (1 - stopPct)
+
+                  // RS raw score (IBD-style weighting)
+                  val rsRaw = 0.4 * (p / c[n - 63] - 1) + 0.2 * (p / c[n - 126] - 1) +
+                      0.2 * (p / c[n - 189] - 1) + 0.2 * (p / c[n - 252] - 1)
+
+                  val contr = fmt0(depths[0] * 100) + "/" + fmt0(depths[1] * 100) + "/" + fmt0(depths[2] * 100)
+                  return Res(
+                      sym, il, p, status, pivot, dist, volX, contr, p / hi - 1, entry, stop, stopPct,
+                      wild, avg50v, trend, vcp, rsRaw, rsLineHigh(b, bench)
+                  )
+              }
+
+              // -------------------------------------------------- background alerts
+              private fun today(): String = SimpleDateFormat("yyyyMMdd", Locale.US).format(Calendar.getInstance().time)
+
+              // Re-checks the symbols of the last scan; notifies when one turned into a breakout.
+              fun watch(ctx: Context) {
+                  cancelled = false
+                  val sp = ctx.getSharedPreferences("scan", Context.MODE_PRIVATE)
+                  val raw = sp.getString("results", "") ?: ""
+                  val list = raw.lines().filter { it.isNotBlank() }.mapNotNull { Res.fromLine(it) }
+                  if (list.isEmpty()) return
+                  val day = today()
+                  val notified = HashSet<String>()
+                  val old = sp.getStringSet("notified", HashSet<String>())
+                  if (old != null) {
+                      for (e in old) if (e.startsWith(day)) notified.add(e)
+                  }
+                  val hits = ArrayList<String>()
+                  for (r in list) {
+                      if (r.status == "BREAKOUT") continue
+                      val key = day + ":" + r.sym
+                      if (notified.contains(key)) continue
+                      val b = fetchBars(r.sym) ?: continue
+                      val a = analyze(r.sym, r.il, b, null) ?: continue
+                      if (a.status == "BREAKOUT" && a.trend) {
+                          hits.add(if (r.il) r.sym.removeSuffix(".TA") else r.sym)
+                          notified.add(key)
+                      }
+                  }
+                  sp.edit().putStringSet("notified", notified).apply()
+                  if (hits.isNotEmpty()) notifyUser(ctx, "Breakout: " + hits.joinToString(", "))
+              }
+
+              private fun notifyUser(ctx: Context, text: String) {
+                  val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                  val chId = "breakout"
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      nm.createNotificationChannel(NotificationChannel(chId, "Breakout alerts", NotificationManager.IMPORTANCE_DEFAULT))
+                  }
+                  val pi = PendingIntent.getActivity(
+                      ctx, 0, Intent(ctx, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
+                  )
+                  val builder = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(ctx, chId) else Notification.Builder(ctx)
+                  builder.setSmallIcon(android.R.drawable.ic_dialog_info)
+                  builder.setContentTitle("Breakout alert")
+                  builder.setContentText(text)
+                  builder.setContentIntent(pi)
+                  builder.setAutoCancel(true)
+                  nm.notify(1, builder.build())
+              }
+          }
+          KTEOF
+          cat > breakout/app/src/main/java/com/scan/breakout/WatchJob.kt <<'KTEOF'
+          package com.scan.breakout
+
+          import android.app.job.JobParameters
+          import android.app.job.JobService
+
+          class WatchJob : JobService() {
+
+              override fun onStartJob(params: JobParameters?): Boolean {
+                  Thread {
+                      try {
+                          Core.watch(applicationContext)
+                      } catch (e: Exception) {
+                      }
+                      jobFinished(params, false)
+                  }.start()
+                  return true
+              }
+
+              override fun onStopJob(params: JobParameters?): Boolean {
+                  Core.cancelled = true
+                  return false
+              }
+          }
+          KTEOF
+          cat > breakout/app/src/main/java/com/scan/breakout/MainActivity.kt <<'KTEOF'
+          package com.scan.breakout
+
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.app.job.JobInfo
+          import android.app.job.JobScheduler
+          import android.content.ComponentName
+          import android.content.Context
+          import android.content.Intent
+          import android.content.SharedPreferences
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.text.InputType
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.ArrayAdapter
+          import android.widget.Button
+          import android.widget.CheckBox
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ListView
+          import android.widget.ProgressBar
+          import android.widget.TextView
+          import android.widget.Toast
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+          import java.util.concurrent.ConcurrentLinkedQueue
+          import java.util.concurrent.Executors
+          import java.util.concurrent.TimeUnit
+          import java.util.concurrent.atomic.AtomicInteger
+
+          class Opts(
+              val sp: Boolean, val nq: Boolean, val t35: Boolean, val t90: Boolean,
+              val rsMin: Double, val minPrice: Double, val minVol: Double, val needVcp: Boolean
+          )
+
+          class MainActivity : Activity() {
+
+              private lateinit var cbSp: CheckBox
+              private lateinit var cbNq: CheckBox
+              private lateinit var cb35: CheckBox
+              private lateinit var cb90: CheckBox
+              private lateinit var cbVcp: CheckBox
+              private lateinit var etRs: EditText
+              private lateinit var etPrice: EditText
+              private lateinit var etVol: EditText
+              private lateinit var etCap: EditText
+              private lateinit var etRisk: EditText
+              private lateinit var btnScan: Button
+              private lateinit var btnAlert: Button
+              private lateinit var tvStatus: TextView
+              private lateinit var tvMarket: TextView
+              private lateinit var progress: ProgressBar
+              private lateinit var adapter: ResAdapter
+              private lateinit var lv: ListView
+
+              private val shown = ArrayList<Res>()
+              private var running = false
+
+              private fun prefs(): SharedPreferences = getSharedPreferences("scan", Context.MODE_PRIVATE)
+
+              // ---------------------------------------------------------------- UI
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val dp = resources.displayMetrics.density
+                  val pad = (10 * dp).toInt()
+
+                  val head = LinearLayout(this)
+                  head.orientation = LinearLayout.VERTICAL
+                  head.setPadding(pad, pad, pad, pad)
+
+                  val title = TextView(this)
+                  title.text = "Breakout Scanner - Trend Template + VCP"
+                  title.textSize = 18f
+                  title.setTypeface(title.typeface, Typeface.BOLD)
+                  head.addView(title)
+
+                  cbSp = check(head, "S&P 500", true)
+                  cbNq = check(head, "Nasdaq-100", true)
+                  cb35 = check(head, "Israel TA-35", true)
+                  cb90 = check(head, "Israel TA-90 (both = TA-125)", true)
+                  cbVcp = check(head, "Require VCP pattern", true)
+
+                  etRs = addRow(head, "RS minimum (0-99)", "70")
+                  etPrice = addRow(head, "Min price (0 = any)", "0")
+                  etVol = addRow(head, "Min avg volume (0 = any)", "0")
+                  etCap = addRow(head, "Capital for sizing (0 = off)", "0")
+                  etRisk = addRow(head, "Risk per trade %", "1")
+
+                  btnScan = Button(this)
+                  btnScan.text = "Start scan"
+                  btnScan.setOnClickListener { startScan() }
+                  btnAlert = Button(this)
+                  btnAlert.text = "Alerts: OFF"
+                  btnAlert.setOnClickListener { toggleAlerts() }
+                  head.addView(buttonRow(btnScan, btnAlert))
+
+                  val b35 = Button(this)
+                  b35.text = "Edit TA-35 list"
+                  b35.setOnClickListener { editList("il35", Core.DEFAULT_IL35, "TA-35 symbols (.TA added automatically)") }
+                  val b90 = Button(this)
+                  b90.text = "Edit TA-90 list"
+                  b90.setOnClickListener { editList("il90", Core.DEFAULT_IL90, "TA-90 symbols (.TA added automatically)") }
+                  head.addView(buttonRow(b35, b90))
+
+                  progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
+                  head.addView(progress)
+
+                  tvStatus = TextView(this)
+                  tvStatus.text = "Ready"
+                  head.addView(tvStatus)
+
+                  tvMarket = TextView(this)
+                  tvMarket.setTypeface(tvMarket.typeface, Typeface.BOLD)
+                  head.addView(tvMarket)
+
+                  lv = ListView(this)
+                  lv.addHeaderView(head, null, false)
+                  adapter = ResAdapter(this, shown)
+                  lv.adapter = adapter
+                  lv.setOnItemClickListener { parent, _, pos, _ ->
+                      val o = parent.getItemAtPosition(pos)
+                      if (o is Res) openChart(o)
+                  }
+                  setContentView(lv)
+
+                  loadSaved()
+              }
+
+              private fun check(parent: LinearLayout, label: String, on: Boolean): CheckBox {
+                  val cb = CheckBox(this)
+                  cb.text = label
+                  cb.isChecked = on
+                  parent.addView(cb)
+                  return cb
+              }
+
+              private fun buttonRow(a: Button, b: Button): LinearLayout {
+                  val row = LinearLayout(this)
+                  row.orientation = LinearLayout.HORIZONTAL
+                  row.addView(a, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                  row.addView(b, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                  return row
+              }
+
+              private fun addRow(parent: LinearLayout, label: String, def: String): EditText {
+                  val row = LinearLayout(this)
+                  row.orientation = LinearLayout.HORIZONTAL
+                  row.gravity = Gravity.CENTER_VERTICAL
+                  val tv = TextView(this)
+                  tv.text = label
+                  val et = EditText(this)
+                  et.setText(def)
+                  et.inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+                  row.addView(tv, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                  row.addView(et, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                  parent.addView(row)
+                  return et
+              }
+
+              private fun ui(f: () -> Unit) {
+                  runOnUiThread { f() }
+              }
+
+              private fun fmt(x: Double, d: Int = 2): String = String.format(Locale.US, "%." + d + "f", x)
+
+              inner class ResAdapter(ctx: Context, list: ArrayList<Res>) : ArrayAdapter<Res>(ctx, 0, list) {
+                  override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                      val tv: TextView = (convertView as? TextView) ?: TextView(context)
+                      tv.setPadding(16, 16, 16, 16)
+                      tv.textSize = 14f
+                      val r = getItem(position)!!
+
+                      val name = if (r.il) r.sym.removeSuffix(".TA") else r.sym
+                      val tag = if (r.il) " [TA-" + r.tier + "]" else ""
+                      val l1 = name + tag + "   " + r.status + "   RS " + r.rs.toInt() +
+                          (if (r.rsHigh) "   *RS-HIGH" else "") + (if (r.isNew) "   NEW" else "")
+                      val l2 = "Price " + fmt(r.price) + " | pivot " + fmt(r.pivot) + " (" + fmt(r.dist * 100, 1) +
+                          "%) | vol x" + fmt(r.volX, 1)
+                      var l3 = "Contractions " + r.contr + "% | from high " + fmt(r.fromHigh * 100, 0) + "%"
+                      if (r.sector.isNotEmpty()) l3 += "\nSector " + r.sector
+
+                      var qty = ""
+                      val cap = etCap.text.toString().toDoubleOrNull() ?: 0.0
+                      val risk = etRisk.text.toString().toDoubleOrNull() ?: 1.0
+                      if (cap > 0) {
+                          val div = if (r.il) 100.0 else 1.0
+                          val perShare = (r.entry - r.stop) / div
+                          if (perShare > 0) {
+                              var q = Math.floor(cap * risk / 100.0 / perShare)
+                              val maxQ = Math.floor(cap / (r.entry / div))
+                              if (q > maxQ) q = maxQ
+                              qty = " | Qty " + q.toInt()
+                          }
+                      }
+                      var l4 = "Entry " + fmt(r.entry) + " | stop " + fmt(r.stop) + " (-" + fmt(r.stopPct * 100, 1) + "%)" +
+                          (if (r.wild) " VOLATILE" else "") + qty
+                      if (r.earn.isNotEmpty()) l4 += "\n! Earnings " + r.earn
+
+                      tv.text = l1 + "\n" + l2 + "\n" + l3 + "\n" + l4
+                      tv.setTextColor(
+                          when (r.status) {
+                              "BREAKOUT" -> Color.rgb(0, 140, 0)
+                              "NEAR PIVOT" -> Color.rgb(0, 70, 200)
+                              else -> Color.BLACK
+                          }
+                      )
+                      return tv
+                  }
+              }
+
+              private fun openChart(r: Res) {
+                  val s = if (r.il) "TASE:" + r.sym.removeSuffix(".TA") else r.sym.replace("-", ".")
+                  val uri = Uri.parse("https://www.tradingview.com/chart/?symbol=" + Uri.encode(s))
+                  startActivity(Intent(Intent.ACTION_VIEW, uri))
+              }
+
+              private fun loadSaved() {
+                  val sp = prefs()
+                  val txt = sp.getString("results", "") ?: ""
+                  val list = txt.lines().filter { it.isNotBlank() }.mapNotNull { Res.fromLine(it) }
+                  shown.addAll(list)
+                  adapter.notifyDataSetChanged()
+                  val t = sp.getLong("lastTime", 0L)
+                  if (t > 0) {
+                      tvStatus.text = "Last scan: " + SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(Date(t)) +
+                          " (" + list.size + " matches)"
+                  }
+                  btnAlert.text = if (sp.getBoolean("alerts", false)) "Alerts: ON" else "Alerts: OFF"
+                  etCap.setText(sp.getString("cap", "0"))
+                  etRisk.setText(sp.getString("risk", "1"))
+              }
+
+              // --------------------------------------------------------- TASE lists
+              private fun editList(key: String, def: String, title: String) {
+                  val et = EditText(this)
+                  et.setText(prefs().getString(key, def) ?: def)
+                  et.minLines = 6
+                  et.gravity = Gravity.TOP
+                  AlertDialog.Builder(this)
+                      .setTitle(title)
+                      .setView(et)
+                      .setPositiveButton("Save") { _, _ ->
+                          prefs().edit().putString(key, et.text.toString()).apply()
+                      }
+                      .setNegativeButton("Cancel", null)
+                      .show()
+              }
+
+              // ------------------------------------------------------------- alerts
+              private fun toggleAlerts() {
+                  val sp = prefs()
+                  val js = getSystemService(Context.JOB_SCHEDULER_SERVICE) as JobScheduler
+                  if (sp.getBoolean("alerts", false)) {
+                      js.cancel(1)
+                      sp.edit().putBoolean("alerts", false).apply()
+                      btnAlert.text = "Alerts: OFF"
+                  } else {
+                      if (Build.VERSION.SDK_INT >= 33) {
+                          requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), 7)
+                      }
+                      val info = JobInfo.Builder(1, ComponentName(this, WatchJob::class.java))
+                          .setPeriodic(30 * 60 * 1000L)
+                          .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
+                          .build()
+                      js.schedule(info)
+                      sp.edit().putBoolean("alerts", true).apply()
+                      btnAlert.text = "Alerts: ON"
+                      Toast.makeText(this, "Re-checks your last scan results about every 30 min", Toast.LENGTH_LONG).show()
+                  }
+              }
+
+              // --------------------------------------------------------------- scan
+              private fun startScan() {
+                  if (running) {
+                      Core.cancelled = true
+                      tvStatus.text = "Stopping..."
+                      return
+                  }
+                  val o = Opts(
+                      cbSp.isChecked, cbNq.isChecked, cb35.isChecked, cb90.isChecked,
+                      etRs.text.toString().toDoubleOrNull() ?: 70.0,
+                      etPrice.text.toString().toDoubleOrNull() ?: 0.0,
+                      etVol.text.toString().toDoubleOrNull() ?: 0.0,
+                      cbVcp.isChecked
+                  )
+                  prefs().edit().putString("cap", etCap.text.toString()).putString("risk", etRisk.text.toString()).apply()
+
+                  running = true
+                  Core.cancelled = false
+                  btnScan.text = "Stop"
+                  shown.clear()
+                  adapter.notifyDataSetChanged()
+                  tvMarket.text = ""
+
+                  Thread {
+                      try {
+                          runScan(o)
+                      } catch (e: Exception) {
+                          ui { tvStatus.text = "Error: " + e.message }
+                      }
+                      ui {
+                          running = false
+                          btnScan.text = "Start scan"
+                      }
+                  }.start()
+              }
+
+              private fun runScan(o: Opts) {
+                  val syms = ArrayList<Pair<String, Boolean>>()
+                  val sectorOf = HashMap<String, String>()
+                  val tierOf = HashMap<String, String>()
+                  var msg = ""
+
+                  if (o.sp || o.nq) {
+                      ui { tvStatus.text = "Loading symbol lists..." }
+                      val us = LinkedHashSet<String>()
+                      if (o.sp) {
+                          val m = Core.loadSp500()
+                          if (m.isEmpty()) msg += "S&P500 list failed. "
+                          sectorOf.putAll(m)
+                          us.addAll(m.keys)
+                      }
+                      if (o.nq) {
+                          val q = Core.loadNdx()
+                          if (q.isEmpty()) msg += "Nasdaq-100 list failed. "
+                          us.addAll(q)
+                      }
+                      for (s in us) syms.add(Pair(s, false))
+                  }
+                  if (o.t35 || o.t90) {
+                      val l35 = Core.parseIl(prefs().getString("il35", Core.DEFAULT_IL35) ?: Core.DEFAULT_IL35)
+                      val l90 = Core.parseIl(prefs().getString("il90", Core.DEFAULT_IL90) ?: Core.DEFAULT_IL90)
+                      val il = LinkedHashSet<String>()
+                      if (o.t90) {
+                          for (s in l90) {
+                              tierOf[s] = "90"
+                              il.add(s)
+                          }
+                      }
+                      if (o.t35) {
+                          for (s in l35) {
+                              tierOf[s] = "35"
+                              il.add(s)
+                          }
+                      }
+                      for (s in il) syms.add(Pair(s, true))
+                  }
+                  if (syms.isEmpty()) {
+                      ui { tvStatus.text = if (msg.isEmpty()) "No symbols to scan" else msg }
+                      return
+                  }
+
+                  // market condition + benchmarks for the RS line
+                  ui { tvStatus.text = "Loading indices..." }
+                  val usIdx = Core.loadIndex(listOf("^GSPC"))
+                  val useIl = o.t35 || o.t90
+                  val i125 = if (useIl) Core.loadIndex(listOf("^TA125.TA", "TA125.TA")) else null
+                  val i35 = if (useIl) Core.loadIndex(listOf("TA35.TA", "^TA35.TA")) else null
+                  val i90 = if (useIl) Core.loadIndex(listOf("TA90.TA", "^TA90.TA")) else null
+                  var mk = "US S&P500: " + Core.trendText(usIdx)
+                  if (useIl) {
+                      mk += "\nTA-35: " + Core.trendText(i35) + "   TA-90: " + Core.trendText(i90) +
+                          "   TA-125: " + Core.trendText(i125)
+                  }
+                  ui { tvMarket.text = mk }
+
+                  val earnings: Map<String, String> =
+                      if (o.sp || o.nq) {
+                          ui { tvStatus.text = "Loading earnings calendar..." }
+                          Core.loadEarnings()
+                      } else {
+                          HashMap<String, String>()
+                      }
+
+                  val pool = Executors.newFixedThreadPool(10)
+                  val out = ConcurrentLinkedQueue<Res>()
+                  val done = AtomicInteger(0)
+                  val failed = AtomicInteger(0)
+                  val total = syms.size
+                  ui {
+                      progress.max = total
+                      progress.progress = 0
+                  }
+                  for (item in syms) {
+                      val sym = item.first
+                      val il = item.second
+                      pool.execute {
+                          if (!Core.cancelled) {
+                              val bars = Core.fetchBars(sym)
+                              if (bars == null) {
+                                  failed.incrementAndGet()
+                              } else {
+                                  val r = Core.analyze(sym, il, bars, if (il) i125 else usIdx)
+                                  if (r != null) {
+                                      r.tier = tierOf[sym] ?: ""
+                                      r.sector = sectorOf[sym] ?: ""
+                                      r.earn = earnings[sym] ?: ""
+                                      out.add(r)
+                                  }
+                              }
+                          }
+                          val d = done.incrementAndGet()
+                          if (d % 25 == 0 || d == total) {
+                              ui {
+                                  progress.progress = d
+                                  tvStatus.text = "Scanned " + d + "/" + total + " | no data: " + failed.get() +
+                                      " | analysed: " + out.size
+                              }
+                          }
+                      }
+                  }
+                  pool.shutdown()
+                  pool.awaitTermination(3, TimeUnit.HOURS)
+
+                  val all = out.toList()
+                  if (all.isEmpty()) {
+                      ui { tvStatus.text = "No data came back. Check internet / try again. " + msg }
+                      return
+                  }
+
+                  // RS percentile, separately for each market
+                  for (grp in listOf(false, true)) {
+                      val g = all.filter { it.il == grp }.sortedBy { it.rsRaw }
+                      for (i in g.indices) g[i].rs = (i + 1) * 100.0 / g.size
+                  }
+
+                  // sector strength (S&P 500 members): average RS per sector, ranked
+                  val bySec = HashMap<String, ArrayList<Double>>()
+                  for (r in all) {
+                      if (!r.il && r.sector.isNotEmpty()) {
+                          var l = bySec[r.sector]
+                          if (l == null) {
+                              l = ArrayList<Double>()
+                              bySec[r.sector] = l
+                          }
+                          l.add(r.rs)
+                      }
+                  }
+                  val secAvg = HashMap<String, Double>()
+                  for ((k, v) in bySec) secAvg[k] = v.sum() / v.size
+                  val secOrder = secAvg.entries.sortedByDescending { it.value }.map { it.key }
+                  for (r in all) {
+                      if (!r.il && r.sector.isNotEmpty()) {
+                          val rank = secOrder.indexOf(r.sector) + 1
+                          r.sector = r.sector + " #" + rank + "/" + secOrder.size + " (avg RS " + fmt(secAvg[r.sector] ?: 0.0, 0) + ")"
+                      }
+                  }
+
+                  val order = mapOf("BREAKOUT" to 0, "NEAR PIVOT" to 1, "BUILDING" to 2)
+                  val hits = all
+                      .filter {
+                          it.trend && it.rs >= o.rsMin && (!o.needVcp || it.vcp) &&
+                              it.price >= o.minPrice && it.avgVol >= o.minVol
+                      }
+                      .sortedWith(compareBy<Res>({ order[it.status] ?: 3 }, { -it.rs }))
+
+                  val stopped = Core.cancelled
+                  val sp = prefs()
+                  val prev = sp.getStringSet("lastSyms", HashSet<String>())
+                  val prevSet = HashSet<String>()
+                  if (prev != null) prevSet.addAll(prev)
+                  for (r in hits) r.isNew = prevSet.isNotEmpty() && !prevSet.contains(r.sym)
+
+                  if (!stopped) {
+                      val syms2 = HashSet<String>()
+                      for (r in hits) syms2.add(r.sym)
+                      sp.edit()
+                          .putString("results", hits.joinToString("\n") { it.toLine() })
+                          .putStringSet("lastSyms", syms2)
+                          .putLong("lastTime", System.currentTimeMillis())
+                          .apply()
+                  }
+
+                  ui {
+                      shown.clear()
+                      shown.addAll(hits)
+                      adapter.notifyDataSetChanged()
+                      tvStatus.text = (if (stopped) "Stopped. " else "Done. ") + hits.size + " matches out of " +
+                          all.size + " analysed (" + failed.get() + " had no data). " + msg
+                  }
+              }
+          }
+          KTEOF
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      - name: Build debug APK
+        working-directory: breakout
+        run: gradle assembleDebug --no-daemon
+
+      - name: Publish APK to Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Breakout Scanner (latest)
+          files: breakout/app/build/outputs/apk/debug/app-debug.apk
